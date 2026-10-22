@@ -13,3 +13,13 @@ __pycache__/
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# Never commit credentials, even by accident
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+credentials.json
