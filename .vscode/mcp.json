@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "memory": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/mcp/memory_server.py"
+      ],
+      "env": {
+        "MEMORY_ROOT": "${workspaceFolder}/.copilot/memory",
+        "MEMORY_LAYOUT": "flat",
+        "MEMORY_ORGANIZE": "dated"
+      }
+    }
+  }
+}

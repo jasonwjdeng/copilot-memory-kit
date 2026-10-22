@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitHub Copilot 记忆功能落地方案 · 公司电脑版</title>
+<style>
+  :root{
+    --bg:#ffffff; --bg-soft:#f7f8fa; --bg-code:#f2f3f5;
+    --fg:#1f2328; --fg-soft:#59636e; --fg-faint:#818b98;
+    --line:#d1d9e0; --line-soft:#e4e8ed;
+    --blue:#0969da; --blue-bg:#ddf4ff;
+    --green:#1a7f37; --green-bg:#dafbe1;
+    --amber:#9a6700; --amber-bg:#fff8c5;
+    --red:#cf222e; --red-bg:#ffebe9;
+    --purple:#8250df; --purple-bg:#fbefff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg-soft); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:15px; line-height:1.75;
+  }
+  .wrap{max-width:960px; margin:0 auto; padding:48px 28px 96px}
+  header{border-bottom:1px solid var(--line); padding-bottom:24px; margin-bottom:36px}
+  h1{font-size:30px; font-weight:600; margin:0 0 10px; letter-spacing:-0.01em}
+  .sub{color:var(--fg-soft); font-size:14px; margin:0}
+  .constraint{
+    margin-top:18px; padding:12px 16px; border-radius:8px;
+    background:var(--amber-bg); border:1px solid #d4a72c66;
+    font-size:13.5px; color:#633c01;
+  }
+  h2{
+    font-size:21px; font-weight:600; margin:44px 0 14px;
+    padding-bottom:8px; border-bottom:1px solid var(--line-soft);
+  }
+  h3{font-size:16px; font-weight:600; margin:26px 0 10px}
+  p{margin:12px 0}
+  code{
+    background:var(--bg-code); padding:2px 6px; border-radius:4px;
+    font-family:"SF Mono",Menlo,Consolas,monospace; font-size:12.5px;
+    color:#0a3069;
+  }
+  pre{
+    background:#f6f8fa; border:1px solid var(--line-soft); border-radius:8px;
+    padding:14px 16px; overflow-x:auto; margin:14px 0;
+    font-family:"SF Mono",Menlo,Consolas,monospace; font-size:12.5px; line-height:1.6;
+  }
+  pre code{background:none; padding:0; color:var(--fg); font-size:12.5px}
+  table{width:100%; border-collapse:collapse; margin:16px 0; font-size:14px}
+  th,td{border:1px solid var(--line-soft); padding:9px 12px; text-align:left; vertical-align:top}
+  th{background:var(--bg-soft); font-weight:600; white-space:nowrap}
+  .yes{color:var(--green); font-weight:600}
+  .no{color:var(--red); font-weight:600}
+  .layers{display:grid; gap:12px; margin:20px 0}
+  .layer{
+    display:grid; grid-template-columns:110px 1fr; gap:16px; align-items:start;
+    padding:14px 16px; border-radius:10px; border:1px solid var(--line-soft); background:var(--bg);
+  }
+  .layer .t{font-weight:600; font-size:14px}
+  .layer .d{font-size:13.5px; color:var(--fg-soft)}
+  .l1{background:var(--blue-bg); border-color:#54aeff66}
+  .l1 .t{color:#0a3069}
+  .l2{background:var(--green-bg); border-color:#4ac26b66}
+  .l2 .t{color:#0f5323}
+  .l3{background:var(--purple-bg); border-color:#c297ff66}
+  .l3 .t{color:#4c2889}
+  .callout{
+    padding:14px 18px; border-radius:8px; margin:18px 0;
+    border-left:4px solid var(--blue); background:var(--bg);
+    border-top:1px solid var(--line-soft); border-right:1px solid var(--line-soft); border-bottom:1px solid var(--line-soft);
+  }
+  .callout.warn{border-left-color:#d4a72c}
+  .callout.key{border-left-color:var(--purple)}
+  .callout .h{font-weight:600; margin-bottom:6px; font-size:14px}
+  ol,ul{margin:12px 0; padding-left:24px}
+  li{margin:7px 0}
+  .step{
+    display:grid; grid-template-columns:34px 1fr; gap:14px; align-items:start;
+    margin:16px 0; padding:14px 16px; border-radius:10px;
+    background:var(--bg); border:1px solid var(--line-soft);
+  }
+  .step .n{
+    width:28px; height:28px; border-radius:50%; background:var(--blue); color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600;
+  }
+  .step .b{font-size:14px}
+  .step .b strong{display:block; margin-bottom:3px; font-size:14.5px}
+  .step .b span{color:var(--fg-soft); font-size:13.5px}
+  .files{margin:16px 0; border-radius:8px; overflow:hidden; border:1px solid var(--line-soft)}
+  .files div{padding:9px 14px; font-family:"SF Mono",Menlo,Consolas,monospace; font-size:12.5px; background:var(--bg)}
+  .files div:nth-child(odd){background:var(--bg-soft)}
+  .files span{color:var(--fg-faint); font-family:inherit}
+  footer{margin-top:60px; padding-top:20px; border-top:1px solid var(--line); font-size:13px; color:var(--fg-faint)}
+  a{color:var(--blue)}
+  .nowrap{white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>GitHub Copilot 记忆功能落地方案</h1>
+  <p class="sub">公司电脑版 · VS Code Copilot 插件 · 无 CLI · 无云端 Memory</p>
+  <div class="constraint">
+    <strong>约束条件</strong>：公司电脑使用；只有 VS Code 的 GitHub Copilot 插件；没有 Copilot CLI；企业策略禁用云端 Copilot Memory。<br>
+    <strong>安装方式</strong>：推荐用户级安装（<code>python install_user.py</code>）——装在用户主目录，装一次所有仓库都能用，记忆按仓库自动分区。
+  </div>
+</header>
+
+<h2>一、结论：能力边界</h2>
+<table>
+  <thead><tr><th>能力</th><th>能否使用</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>VS Code 内置 Memory Tool</td><td class="yes">可以</td><td>数据只写本机 <code>workspaceStorage</code>，不经过 GitHub 云端</td></tr>
+    <tr><td>MCP server（自建本地记忆）</td><td class="yes">可以</td><td>VS Code 是完整 MCP 客户端，本地 stdio 进程即可</td></tr>
+    <tr><td>指令文件（AGENTS.md 等）</td><td class="yes">可以</td><td>纯本地文件，永远可用</td></tr>
+    <tr><td>Copilot Memory（云端）</td><td class="no">不可以</td><td>需账号侧开启，企业策略常禁用</td></tr>
+    <tr><td>Copilot CLI</td><td class="no">不可以</td><td>未安装或不允许</td></tr>
+  </tbody>
+</table>
+
+<div class="callout key">
+  <div class="h">关键认知</div>
+  WorkBuddy 的「记忆」本质是<strong>仓库里可版本化的 Markdown 文件</strong>。要在 Copilot 侧做到同构，重点不是找一个「云端记忆」开关，而是让 Copilot 的记忆<strong>落到真实文件里</strong>——这样它能进 git、能跨机器同步、能被其他 agent 读到。
+</div>
+
+<h2>二、三层等价结构</h2>
+<div class="layers">
+  <div class="layer l1">
+    <div class="t">第 1 层 · 指令层</div>
+    <div class="d"><code>AGENTS.md</code> / <code>.github/copilot-instructions.md</code> — 稳定规则，常驻注入上下文</div>
+  </div>
+  <div class="layer l2">
+    <div class="t">第 2 层 · 记忆层</div>
+    <div class="d"><code>.copilot/memory/*.md</code>（经 MCP 读写）— 运行时积累，进 git，可跨 agent</div>
+  </div>
+  <div class="layer l3">
+    <div class="t">第 3 层 · 会话层</div>
+    <div class="d">Copilot 内置 Memory Tool 的 session scope — 单次对话的临时笔记</div>
+  </div>
+</div>
+
+<h2>三、方案 A：只用内置 Memory Tool（零配置）</h2>
+
+<h3>3.1 确认设置</h3>
+<p><code>Ctrl+Shift+P</code> → <code>Preferences: Open User Settings (JSON)</code>：</p>
+<pre><code>{
+  "github.copilot.chat.tools.memory.enabled": true
+}</code></pre>
+<p>这个开关<strong>默认就是开的</strong>，且是纯本地功能，不依赖 Copilot Memory。</p>
+
+<h3>3.2 三档 scope</h3>
+<table>
+  <thead><tr><th>scope</th><th>路径</th><th>跨会话</th><th>跨项目</th><th>适合装</th></tr></thead>
+  <tbody>
+    <tr><td>User</td><td><code>/memories/</code></td><td class="yes">是</td><td class="yes">是（前 200 行自动注入）</td><td>个人偏好、常用命令</td></tr>
+    <tr><td>Repository</td><td><code>/memories/repo/</code></td><td class="yes">是</td><td class="no">否</td><td>仓库约定、构建命令</td></tr>
+    <tr><td>Session</td><td><code>/memories/session/</code></td><td class="no">否</td><td class="no">否</td><td>当前任务临时笔记</td></tr>
+  </tbody>
+</table>
+<p>在 Chat 里直接说「记住：…」即可，模型会自己判断落到哪一档。管理命令：<code>Chat: Show Memory Files</code> / <code>Chat: Clear All Memory Files</code>。</p>
+
+<div class="callout warn">
+  <div class="h">致命限制 — 这才是需要上 MCP 的原因</div>
+  这些文件落在 VS Code 的 <code>workspaceStorage</code> 里，<strong>不在你的仓库里</strong>：公司电脑 ↔ 家里电脑不同步；不进 git，同事看不到；换 profile 或重装扩展可能丢；Claude Code / Codex / WorkBuddy 完全读不到。
+</div>
+
+<h2>四、方案 B：本地 MCP 记忆层（推荐）</h2>
+<p>本方案提供的记忆 MCP server <strong>零依赖</strong>——只用 Python 标准库，不联网、不需要 API key，把记忆存成仓库里的 Markdown。</p>
+
+<div class="callout key">
+  <div class="h">两种装法，先选一个</div>
+  <strong>用户级</strong>（<code>python install_user.py</code>）装在用户主目录，<strong>装一次，所有仓库都能用</strong>，记忆按仓库自动分区——<strong>公司电脑推荐这个</strong>。
+  <strong>仓库级</strong>（<code>./install.sh</code>）装在每个仓库里，记忆跟着仓库进 git、能共享给同事。
+</div>
+
+<h3>4.1 用户级安装（装一次，全机共享）</h3>
+<div class="step">
+  <div class="n">1</div>
+  <div class="b"><strong>执行安装</strong><span>Windows 用 Git Bash 或 PowerShell 都行，<code>py install_user.py</code> 也可以。纯标准库，无需 pip install。先用 <code>--dry-run</code> 看它要干什么而不实际写盘。</span></div>
+</div>
+<div class="step">
+  <div class="n">2</div>
+  <div class="b"><strong>重启 VS Code，打开任意仓库</strong><span>然后 <code>Ctrl+Shift+P</code> → <code>MCP: List Servers</code> → 启动 <code>memory</code>。</span></div>
+</div>
+<div class="step">
+  <div class="n">3</div>
+  <div class="b"><strong>验证</strong><span>Chat 里问「调用 memory_write 记住：这个项目用 pnpm 不是 npm」，再问「调用 memory_list 看看记住了什么」。切到<strong>另一个</strong>仓库再问，应该看不到刚才那条，但能看到 global 里的。</span></div>
+</div>
+<div class="step">
+  <div class="n">4</div>
+  <div class="b"><strong>卸载</strong><span><code>python install_user.py --uninstall</code>，只移除装的东西，你原有的配置和偏好完整保留。</span></div>
+</div>
+
+<h3>用户级装在哪</h3>
+<div class="files">
+  <div>~/.copilot/memory-kit/memory_server.py <span>— server 本体</span></div>
+  <div>~/.copilot/memory/ <span>— 共享记忆存储（global/ + projects/）</span></div>
+  <div>~/.copilot/instructions/memory.instructions.md <span>— 用户级定向指令</span></div>
+  <div>~/.copilot/copilot-instructions.md <span>— 用户级常驻指令（追加，不覆盖原内容）</span></div>
+  <div>%APPDATA%\Code\User\mcp.json <span>— VS Code 用户级 MCP 配置</span></div>
+  <div>~/.copilot/mcp-config.json <span>— 便携式 MCP 配置（Copilot harness 直接读）</span></div>
+</div>
+
+<h3>记忆怎么分区</h3>
+<div class="files">
+  <div>~/.copilot/memory/global/ <span>— 跨项目通用规则（提交规范、个人偏好）</span></div>
+  <div>~/.copilot/memory/projects/my-backend-a1b2c3/ <span>— 只属于这个仓库的记忆</span></div>
+  <div>~/.copilot/memory/projects/my-frontend-d4e5f6/ <span>— 另一个仓库，互不可见</span></div>
+</div>
+<p>项目身份来自 server 启动时的<strong>工作目录</strong>——VS Code 启动 stdio server 时工作目录就是当前打开的仓库。server 会向上找最近的 <code>.git</code> 目录确定项目根，所以 monorepo 子目录也算同一个项目；目录名后缀是路径短哈希，防止同名仓库撞车。想手动指定就设 <code>MEMORY_PROJECT</code>。</p>
+
+<table>
+  <thead><tr><th>scope</th><th>写到哪</th><th>检索时看到</th></tr></thead>
+  <tbody>
+    <tr><td><code>project</code>（默认）</td><td>当前仓库的分区</td><td>本项目 + global</td></tr>
+    <tr><td><code>global</code></td><td><code>global/</code></td><td>只看 global</td></tr>
+    <tr><td><code>all</code></td><td>—</td><td>所有项目的分区 + global</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="h">唯一需要你注意的</div>
+  <strong>跨项目通用的规则才写 <code>global</code></strong>。把项目专属决策放进 global 会污染其他仓库——这是这套设计里唯一会「串味」的地方。
+</div>
+
+<h3>记忆怎么组织：按日期 + 长期沉淀</h3>
+<p>每个分区内部按<strong>日期</strong>分文件，和 WorkBuddy 的记忆结构一致：</p>
+<div class="files">
+  <div>projects/my-backend-a1b2c3/MEMORY.md <span>— 长期沉淀：跨天仍成立的规则</span></div>
+  <div>projects/my-backend-a1b2c3/2026-10-22.md <span>— 当天的日志</span></div>
+</div>
+<p>一个文件里放多条记忆，每条以二级标题开头：</p>
+<pre><code>## 数据库迁移必须先写回滚脚本
+
+&lt;!-- tags: db, migration --&gt;
+&lt;!-- updated: 2026-10-22T12:00:00+08:00 --&gt;
+
+迁移脚本要配套回滚脚本，否则线上出问题无法快速恢复。
+</code></pre>
+<table>
+  <thead><tr><th>操作</th><th>落在哪</th></tr></thead>
+  <tbody>
+    <tr><td><code>memory_write</code>（默认）</td><td>追加到<strong>当天</strong>的日志文件</td></tr>
+    <tr><td><code>memory_write</code> + <code>bucket: "curated"</code></td><td>写进 <code>MEMORY.md</code></td></tr>
+    <tr><td><code>memory_write</code>（同标题已存在）</td><td><strong>原位更新</strong>那条，不新增</td></tr>
+  </tbody>
+</table>
+<p>日常琐事、临时决策 → 日志文件；反复出现、跨天仍成立的规则（提交规范、架构约定、用户明确表达的偏好）→ <code>MEMORY.md</code>。</p>
+<p>正文里可以自由用 <code>#</code> 和 <code>###</code> 标题，但 <code>##</code> 会开启新条目——代码块（<code>```</code>）里的 <code>##</code> 不会被误解析。</p>
+
+<div class="callout">
+  <div class="h">旧 store 怎么办</div>
+  「一记忆一文件」的旧格式两种模式都能读，<strong>不需要转换</strong>：换了组织方式只影响新写入落在哪，旧文件照旧可检索。
+</div>
+
+<h3>4.2 仓库级安装（记忆跟着仓库走）</h3>
+<div class="step">
+  <div class="n">1</div>
+  <div class="b"><strong>安装到目标仓库</strong><span><code>./install.sh /path/to/your-repo</code>，脚本幂等，不删除任何已有文件；<code>--force</code> 才覆盖。</span></div>
+</div>
+<div class="step">
+  <div class="n">2</div>
+  <div class="b"><strong>启动 MCP server</strong><span>VS Code 里 <code>Ctrl+Shift+P</code> → <code>MCP: List Servers</code> → 找到 <code>memory</code> → start。或直接开 Agent 会话，工具自动出现。</span></div>
+</div>
+<div class="step">
+  <div class="n">3</div>
+  <div class="b"><strong>验证</strong><span>Chat 里问「调用 memory_write 记住：数据库迁移必须先写回滚脚本」，然后「调用 memory_list 看看记住了什么」。仓库里应出现 <code>.copilot/memory/</code> 下的新文件。</span></div>
+</div>
+<div class="step">
+  <div class="n">4</div>
+  <div class="b"><strong>纳入 git</strong><span><code>git add .copilot AGENTS.md .github .vscode mcp</code>。若不想提交记忆本体，在 <code>.gitignore</code> 里加 <code>.copilot/memory/*.md</code> 并保留 <code>MEMORY.md</code> 索引。</span></div>
+</div>
+
+<h3>安装后的仓库结构</h3>
+<div class="files">
+  <div>AGENTS.md <span>— 跨工具规则，Copilot / Claude / Codex 都读</span></div>
+  <div>.github/copilot-instructions.md <span>— Copilot 专属、常驻注入的记忆协议</span></div>
+  <div>.github/instructions/memory.instructions.md <span>— 按 applyTo glob 定向</span></div>
+  <div>.vscode/mcp.json <span>— MCP 客户端配置（顶层 servers 键）</span></div>
+  <div>mcp/memory_server.py <span>— 零依赖记忆 server</span></div>
+  <div>.copilot/memory/MEMORY.md <span>— 长期沉淀的记忆</span></div>
+  <div>.copilot/memory/2026-10-22.md <span>— 当天的日志（按日期自动命名）</span></div>
+</div>
+
+<h3>MCP 暴露的工具</h3>
+<table>
+  <thead><tr><th>工具</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>memory_search(query, limit, scope, since, until)</code></td><td>关键词检索；标题命中权重 3×、标签 1×、正文 0.5×；中文按字 + 二元组切分；可按日期区间过滤</td></tr>
+    <tr><td><code>memory_write(title, content, tags, scope, bucket)</code></td><td>写入或更新一条记忆，同标题自动原位更新；<code>bucket</code> 选 <code>daily</code>（默认）或 <code>curated</code></td></tr>
+    <tr><td><code>memory_read(name, scope)</code></td><td>读全文；<code>name</code> 传日期（<code>2026-10-22</code>）可读出那天的全部记忆</td></tr>
+    <tr><td><code>memory_list(scope, date, bucket)</code></td><td>列出全部，带预览；可按日期或 bucket 过滤</td></tr>
+    <tr><td><code>memory_delete(name)</code></td><td>删除，仅在明确要求时使用</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="h">装了 MCP 不等于 Copilot 会主动调用</div>
+  必须靠指令层驱动。<code>.github/copilot-instructions.md</code>（或用户级的 <code>~/.copilot/copilot-instructions.md</code>）写明了：开工前先 <code>memory_search</code>；命中结果<strong>优先于</strong>默认做法（那是这个项目真正做过的决定）；用户表态、决策消歧、发现非显然事实就 <code>memory_write</code>；记忆过时则改，不要新增一条矛盾的。
+</div>
+
+<h2>五、指令层分工</h2>
+<table>
+  <thead><tr><th>文件</th><th>读它的东西</th><th>放什么</th><th>同步方式</th></tr></thead>
+  <tbody>
+    <tr><td><code>AGENTS.md</code></td><td>所有主流 agent（Copilot / Claude Code / Codex / opencode / pi）</td><td>跨工具通用：构建命令、目录约定、提交规范</td><td>走 git</td></tr>
+    <tr><td><code>.github/copilot-instructions.md</code></td><td>仅 Copilot</td><td>Copilot 专属行为、记忆协议</td><td>走 git</td></tr>
+    <tr><td><code>.github/instructions/*.instructions.md</code></td><td>仅 Copilot，按 <code>applyTo</code> glob 触发</td><td>特定语言或目录的规则</td><td>走 git</td></tr>
+    <tr><td><code>~/.copilot/copilot-instructions.md</code></td><td>仅 Copilot，跨项目</td><td>个人全局偏好</td><td>不同步（<code>~/.copilot/instructions</code> 不走 Settings Sync）</td></tr>
+  </tbody>
+</table>
+<div class="callout warn">
+  <div class="h">冲突不会被规则解决</div>
+  GitHub 现在多个自定义指令文件是<strong>合并</strong>的，不再按优先级回退。别在两个文件里写互相矛盾的内容——冲突不会让某个文件胜出，只会让模型困惑。
+</div>
+
+<h2>六、公司电脑特有注意事项</h2>
+<ol>
+  <li><strong>不能装东西</strong> — 本方案只依赖系统自带 python3，无需 pip install。Windows 上 <code>install_user.py</code> 会自动找 <code>python.exe</code> 或 <code>py</code> 启动器下的解释器，找不到就用 <code>--python</code> 手动指定；macOS/Linux 上 <code>/usr/bin/python3</code> 即可。</li>
+  <li><strong>不能联网</strong> — 记忆 server 完全离线；<code>memory_search</code> 是本地关键词检索，不调用 embedding API。</li>
+  <li><strong>MCP 审批</strong> — 首次调用工具会弹权限确认，选「Always allow」避免每次都点。</li>
+  <li><strong>企业策略可能禁用 MCP</strong> — 若 <code>MCP: List Servers</code> 看不到 server，退回纯文件方案：让 Copilot 直接用内置 <code>read_file</code> / <code>edit_file</code> 读写 <code>~/.copilot/memory/</code> 下的 Markdown，指令文件里已写了这条降级路径。</li>
+  <li><strong>仓库不能提交</strong> — 把 <code>MEMORY_ROOT</code> 指到仓库外，例如 <code>~/copilot-memories/&lt;repo-name&gt;</code>，改 MCP 配置的 <code>env</code> 即可。</li>
+  <li><strong>多仓库共用一份记忆</strong> — 用用户级安装，它自动按仓库分区，既共享又不会串味。</li>
+  <li><strong>不想留痕于用户目录</strong> — 用户级安装只写 <code>~/.copilot/</code> 和 VS Code 用户配置目录，不碰任何仓库目录，卸载用 <code>python install_user.py --uninstall</code>。</li>
+</ol>
+
+<h2>七、验证状态</h2>
+<p>本机已实测通过：协议握手 <code>initialize</code>、<code>tools/list</code>、写入、检索（含中文查询「commit 规范怎么写」正确命中）、读取、缺失记忆报错、<code>MEMORY_ROOT</code> 路径解析、安装脚本幂等性。</p>
+<p>用户级安装额外实测通过：<strong>仓库分区隔离</strong>（A 仓库看不到 B 仓库的记忆）、<strong>已有用户配置的合并保留</strong>（<code>mcp.json</code> 里带注释的 JSONC、其他 server 条目、你写的个人偏好全部原样保留）、<strong>卸载精确还原</strong>、<strong>JSONC 解析</strong>、<strong>Windows 路径解析</strong>。</p>
+<p>按日期组织的布局实测通过：<strong>同日多条</strong>写入同一文件、<strong>同标题原位更新</strong>不产生重复、<strong>删除单条</strong>不影响同文件其他条目、<strong>按日期读取</strong>、<strong>curated 与 daily 分桶</strong>、<strong>旧格式 store 的读取</strong>、<strong>代码块内的 <code>##</code> 不被误解析</strong>、<strong>多进程并发写入不丢条目</strong>。</p>
+<p>回归测试固定在 <code>tests/test_smoke.py</code>（19 个用例，仅标准库）：<code>python3 tests/test_smoke.py</code>。</p>
+
+<footer>
+  参考来源：VS Code Memory 文档（code.visualstudio.com/docs/agents/run/memory）·
+  Copilot 自定义功能速查（docs.github.com/en/copilot/reference/customization-cheat-sheet）·
+  VS Code 自定义指令（code.visualstudio.com/docs/agent-customization/custom-instructions）
+</footer>
+
+</div>
+</body>
+</html>

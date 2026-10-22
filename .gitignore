@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local memory store written when the server runs in this repository.
+# The template ships as memory/MEMORY.md; what you actually remember is local.
+.copilot/
+
+# Agent working notes for this workspace (change to `!.workbuddy/` if you
+# want them in the repository's history).
+.workbuddy/
+
+# Editor / OS noise
+.DS_Store
+*.swp
