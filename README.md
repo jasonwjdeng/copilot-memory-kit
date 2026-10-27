@@ -398,7 +398,7 @@ git commit -m "chore: add local memory layer for Copilot"
 **旧格式 store 的读取**、**代码块内的 `##` 不被误解析**、**多进程并发写入不丢条目**、
 **超长标题不再撞同一文件**。
 
-这些检查现在固定成 `tests/test_smoke.py`（19 个用例，仅标准库），跑一条命令即可：
+这些检查现在固定成 `tests/test_smoke.py`（28 个用例，仅标准库），跑一条命令即可：
 
 ```bash
 python3 tests/test_smoke.py

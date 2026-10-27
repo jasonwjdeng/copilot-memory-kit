@@ -158,11 +158,18 @@ def as_date(value: Any) -> str:
 
 
 def write_text_atomic(path: Path, text: str) -> None:
-    """Write via a temp file so a crash cannot leave a truncated store."""
+    """Write via a unique temp file so a crash cannot leave a truncated store."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent,
+        prefix=f".{path.name}.", suffix=".tmp", delete=False,
+    ) as handle:
+        tmp = Path(handle.name)
+        handle.write(text)
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 LOCK_TIMEOUT = 5.0
@@ -210,17 +217,12 @@ def _unlock(fd: int) -> None:
 def store_lock(timeout: float = LOCK_TIMEOUT):
     """Serialise writers across processes.
 
-    Best effort by design: on timeout the caller proceeds without the lock and
-    says so on stderr. A held lock that never releases would otherwise block
-    the tool call -- and with it the editor session -- forever.
+    Writers must never fall back to an unlocked read-modify-write: another
+    process could then overwrite their entries. A lock failure rejects the
+    write and is returned to the caller as a tool error.
     """
-    try:
-        path = lock_path()
-        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
-    except OSError as exc:
-        print(f"memory: cannot open lock file: {exc}", file=sys.stderr)
-        yield
-        return
+    path = lock_path()
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
 
     acquired = False
     try:
@@ -232,9 +234,7 @@ def store_lock(timeout: float = LOCK_TIMEOUT):
                 break
             except OSError:
                 if time.monotonic() >= deadline:
-                    print(f"memory: lock timeout after {timeout:g}s; "
-                          "writing without it", file=sys.stderr)
-                    break
+                    raise TimeoutError(f"could not acquire store lock within {timeout:g}s")
                 time.sleep(0.02)
         yield
     finally:
@@ -250,8 +250,11 @@ def locked(func):
     """Run a write tool with the store lock held."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        with store_lock():
-            return func(*args, **kwargs)
+        try:
+            with store_lock():
+                return func(*args, **kwargs)
+        except OSError as exc:
+            return _failed(f"Could not write memory: {exc}")
     return wrapper
 
 
@@ -572,14 +575,14 @@ def delete_entry(path: Path, title: str) -> bool:
 
 
 def drop_if_empty(path: Path) -> None:
-    """Delete a daily log that no longer holds any entry."""
+    """Delete an untouched generated daily log that no longer holds entries."""
     if path.name == CURATED_FILENAME or not path.exists():
         return
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return
-    if _entry_matches(text):
+    if _entry_matches(text) or text.strip() != f"# {path.stem}":
         return
     try:
         path.unlink()
@@ -863,14 +866,10 @@ def _find_by_title(title: str, directory: Path, label: str) -> dict[str, Any] | 
     memory that happened to share the title.
     """
     target = normalize_title(title)
-    target_slug = slugify(target)
-    fallback = None
     for doc in docs_in_directory(directory, label):
         if normalize_title(doc.get("title", "")) == target:
             return doc
-        if fallback is None and slugify(doc.get("title", "")) == target_slug:
-            fallback = doc
-    return fallback
+    return None
 
 
 def _result(action: str, name: str, title: str, tags: list[str], scope: str,
@@ -968,7 +967,20 @@ def tool_memory_write(title: str, content: str, tags: list[str] | None = None,
 
     # One file per memory. ``bucket`` has no meaning here: every memory is its
     # own file, so it is reported as empty rather than echoed back.
-    path = directory / f"{slugify(title)}.md"
+    base = slugify(title)
+    path = directory / f"{base}.md"
+    digest = hashlib.sha1(title.encode("utf-8")).hexdigest()[:8]
+    collisions = 0
+    while path.exists():
+        old_title = normalize_title(read_doc(path).get("title", ""))
+        if old_title == title:
+            break
+        # Sanitisation is not injective (for example ``a/b`` and ``ab``).
+        # A natural title may itself occupy the disambiguated path, so keep
+        # looking until the path is free or belongs to this exact title.
+        collisions += 1
+        suffix = digest if collisions == 1 else f"{digest}-{collisions}"
+        path = directory / f"{base}-{suffix}.md"
     existed = path.exists()
     # Preserve the original title on overwrite so renaming the file is a
     # deliberate act rather than an accidental one.
@@ -1076,13 +1088,18 @@ def tool_memory_delete(name: str) -> dict[str, Any]:
         return _failed(f"No memory named '{name}'.")
     path = Path(doc["path"])
     if doc.get("format") == "dated":
-        delete_entry(path, doc.get("title", ""))
-        drop_if_empty(path)
+        try:
+            deleted = delete_entry(path, doc.get("title", ""))
+            drop_if_empty(path)
+        except OSError as exc:
+            return _failed(f"Could not delete memory '{name}': {exc}")
+        if not deleted:
+            return _failed(f"Could not delete memory '{name}' from {path}.")
     else:
         try:
             path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            return _failed(f"Could not delete memory '{name}': {exc}")
     return {
         "content": [{"type": "text", "text": json.dumps({"deleted": doc.get("name", "")},
                                                        ensure_ascii=False)}],

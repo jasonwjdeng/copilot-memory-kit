@@ -555,9 +555,12 @@ def install(args: argparse.Namespace) -> int:
             pass
 
     rep.write(STORE / "MEMORY.md", STORE_INDEX + "\n")
-    # Curated file for the global scope. Project partitions get their own
-    # MEMORY.md the first time something is promoted into them.
-    rep.write(STORE / "global" / "MEMORY.md", GLOBAL_CURATED + "\n")
+    # Curated memory is user data: initialise it once, never refresh it on
+    # reinstall or upgrade. Project partitions get their own MEMORY.md the
+    # first time something is promoted into them.
+    global_curated = STORE / "global" / "MEMORY.md"
+    if not global_curated.exists():
+        rep.write(global_curated, GLOBAL_CURATED + "\n")
     if not args.dry_run:
         (STORE / "global").mkdir(parents=True, exist_ok=True)
         (STORE / "projects").mkdir(parents=True, exist_ok=True)

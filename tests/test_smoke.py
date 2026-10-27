@@ -15,11 +15,17 @@ Every test here exists because the corresponding bug shipped once:
 * a string in ``tags`` became one tag per character;
 * a newline in a title forged an extra ``##`` entry;
 * titles longer than 80 characters collided on one file;
-* two processes writing at once could interleave their read-modify-write.
+* two processes writing at once could interleave their read-modify-write;
+* reinstalling replaced the user's curated global memories with the template;
+* lock open/timeout failures allowed a write to proceed without exclusivity;
+* different titles with the same slug overwrote one another;
+* deleting the last entry also deleted manual content in its daily file;
+* failed deletes were reported as successful.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -29,6 +35,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 KIT = Path(__file__).resolve().parent.parent
 SERVER = KIT / "mcp" / "memory_server.py"
@@ -115,6 +122,57 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 0)
         # The emptied daily log is removed rather than left as noise.
         self.assertEqual(self.project_files(), [])
+
+    def test_delete_last_entry_preserves_manual_file_content(self) -> None:
+        created = self.write(title="target", content="body")
+        daily = Path(created["path"])
+        daily.write_text(
+            "# 2026-10-27\n\nmanual preamble that must survive\n\n## target\n\nbody\n",
+            encoding="utf-8",
+        )
+
+        self.call("memory_delete", name="target")
+
+        self.assertTrue(daily.exists())
+        remaining = daily.read_text(encoding="utf-8")
+        self.assertIn("manual preamble that must survive", remaining)
+        self.assertNotIn("## target", remaining)
+
+    def test_dated_delete_failure_is_reported(self) -> None:
+        self.env["MEMORY_LAYOUT"] = "flat"
+        self.write(title="target", content="body")
+        sys.path.insert(0, str(SERVER.parent))
+        try:
+            import memory_server
+        finally:
+            sys.path.pop(0)
+
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(memory_server, "delete_entry", return_value=False):
+                reply = memory_server.tool_memory_delete("target")
+
+        self.assertTrue(reply["isError"], reply)
+        self.assertIn("could not delete", reply["content"][0]["text"].lower())
+
+    def test_file_delete_failure_is_reported(self) -> None:
+        self.env["MEMORY_LAYOUT"] = "flat"
+        self.env["MEMORY_ORGANIZE"] = "file"
+        self.store = self.tmp / "store-file-delete-error"
+        self.env["MEMORY_ROOT"] = str(self.store)
+        self.write(title="target", content="body")
+        sys.path.insert(0, str(SERVER.parent))
+        try:
+            import memory_server
+        finally:
+            sys.path.pop(0)
+
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(Path, "unlink", side_effect=OSError("read-only filesystem")):
+                reply = memory_server.tool_memory_delete("target")
+
+        self.assertTrue(reply["isError"], reply)
+        self.assertIn("read-only filesystem", reply["content"][0]["text"])
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 1)
 
     def test_search_matches_chinese(self) -> None:
         self.write(title="数据库迁移",
@@ -233,6 +291,49 @@ class ServerTest(unittest.TestCase):
             stored = json.loads(tool_text(self.call("memory_read", name=title)))
             self.assertEqual(stored["body"], body)
 
+    def test_file_mode_slug_collisions_preserve_distinct_titles(self) -> None:
+        self.env["MEMORY_ORGANIZE"] = "file"
+        self.store = self.tmp / "store-file-collisions"
+        self.env["MEMORY_ROOT"] = str(self.store)
+
+        first = self.write(title="a/b", content="first body")
+        second = self.write(title="ab", content="second body")
+
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 2)
+        for title, body in (("a/b", "first body"), ("ab", "second body")):
+            stored = json.loads(tool_text(self.call("memory_read", name=title)))
+            self.assertEqual(stored["title"], title)
+            self.assertEqual(stored["body"], body)
+
+    def test_file_mode_disambiguated_path_collision_preserves_all_titles(self) -> None:
+        self.env["MEMORY_ORGANIZE"] = "file"
+        self.store = self.tmp / "store-file-secondary-collision"
+        self.env["MEMORY_ROOT"] = str(self.store)
+        digest = hashlib.sha1(b"a/b").hexdigest()[:8]
+        natural_title = f"ab-{digest}"
+
+        self.write(title="ab", content="base body")
+        self.write(title=natural_title, content="natural body")
+        self.write(title="a/b", content="slash body")
+
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 3)
+        for title, body in (("ab", "base body"), (natural_title, "natural body"),
+                            ("a/b", "slash body")):
+            stored = json.loads(tool_text(self.call("memory_read", name=title)))
+            self.assertEqual(stored["title"], title)
+            self.assertEqual(stored["body"], body)
+
+    def test_dated_mode_slug_collisions_preserve_distinct_titles(self) -> None:
+        self.write(title="a/b", content="first body")
+        self.write(title="ab", content="second body")
+
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 2)
+        for title, body in (("a/b", "first body"), ("ab", "second body")):
+            stored = json.loads(tool_text(self.call("memory_read", name=title)))
+            self.assertEqual(stored["title"], title)
+            self.assertEqual(stored["body"], body)
+
     def test_lock_is_exclusive_across_processes(self) -> None:
         # A second VS Code window is a second process. The lock is what keeps
         # their read-modify-write cycles from interleaving.
@@ -264,6 +365,47 @@ class ServerTest(unittest.TestCase):
         holder.communicate(timeout=30)
         self.assertEqual(probe.stdout.strip(), "got", probe.stderr)
         self.assertGreater(waited, 0.5, "store_lock did not block the second process")
+
+    def test_lock_timeout_rejects_write_instead_of_writing_unlocked(self) -> None:
+        holder_script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SERVER.parent)!r})\n"
+            "import memory_server\n"
+            "with memory_server.store_lock():\n"
+            "    print('held', flush=True)\n"
+            "    sys.stdin.readline()\n"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env=self.env, cwd=str(self.repo),
+        ) as holder:
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                reply = self.call("memory_write", title="blocked", content="must not be written")
+                self.assertTrue(reply["result"]["isError"], reply)
+                self.assertIn("lock", tool_text(reply).lower())
+            finally:
+                holder.stdin.write("\n")
+                holder.stdin.flush()
+                holder.wait(timeout=30)
+
+        listed = json.loads(tool_text(self.call("memory_list", scope="project")))
+        self.assertEqual(listed["count"], 0)
+
+    def test_lock_open_failure_rejects_write(self) -> None:
+        sys.path.insert(0, str(SERVER.parent))
+        try:
+            import memory_server
+        finally:
+            sys.path.pop(0)
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(memory_server, "lock_path", side_effect=OSError("unavailable")):
+                reply = memory_server.tool_memory_write("blocked", "must not be written")
+
+        self.assertTrue(reply["isError"], reply)
+        self.assertIn("unavailable", reply["content"][0]["text"])
+        self.assertFalse(any(self.store.rglob("*.md")))
 
     def test_concurrent_writers_do_not_lose_entries(self) -> None:
         # Each writer is a separate process. Every write rewrites the whole
@@ -341,6 +483,17 @@ class InstallerTest(unittest.TestCase):
         data = json.loads(self.mcp.read_text(encoding="utf-8"))
         self.assertIn("other", data["servers"])
         self.assertIn("memory", data["servers"])
+
+    def test_reinstall_preserves_global_curated_memories(self) -> None:
+        self.assertEqual(self.install().returncode, 0)
+        curated = self.home / ".copilot" / "memory" / "global" / "MEMORY.md"
+        original = "# Global memory\n\n## User fact\n\nmust survive reinstall\n"
+        curated.write_text(original, encoding="utf-8")
+
+        result = self.install()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(curated.read_text(encoding="utf-8"), original)
 
     def test_uninstall_keeps_memories_and_purge_removes_them(self) -> None:
         self.assertEqual(self.install().returncode, 0)
