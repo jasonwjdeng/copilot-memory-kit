@@ -9,6 +9,7 @@ __pycache__/
 # Agent working notes for this workspace (change to `!.workbuddy/` if you
 # want them in the repository's history).
 .workbuddy/
+wiki
 
 # Editor / OS noise
 .DS_Store
