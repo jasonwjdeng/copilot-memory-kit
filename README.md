@@ -66,6 +66,7 @@ python install_user.py --dry-run
 | `~/.copilot/copilot-instructions.md` | 用户级常驻指令（**追加**，不覆盖你原有内容） |
 | `%APPDATA%\Code\User\mcp.json` | VS Code 用户级 MCP 配置（Windows；macOS 是 `~/Library/Application Support/Code/User/mcp.json`） |
 | `~/.copilot/mcp-config.json` | 便携式 MCP 配置（Copilot harness 直接读） |
+| `~/.copilot/.locks/` | 写入互斥锁，不在 temp 目录（见下）；可随时删除，下次写入自动重建 |
 
 两个 MCP 配置文件都会写，目的是覆盖不同会话类型：VS Code 原生会话读前者，
 Copilot/Agent Host 会话读后者。已有的 server 条目和你自己写的配置**都会保留**。
@@ -132,8 +133,10 @@ projects/my-backend-a1b2c3/
 规则（提交规范、架构约定、用户明确表达的偏好）→ `MEMORY.md`。
 日志文件本身就是「那天干了什么」的完整记录，`MEMORY.md` 是被提炼过的结论。
 
-正文里可以自由用 `#` 和 `###` 标题，但 `##` 会开启新条目——代码块（```）里的
-`##` 不会被误解析。
+正文里可以自由用 `#` 和 `###` 标题。行首的 `## ` 在**写入时**会被降级成 `### `
+（`##` 本来的含义是「新条目」，留着它一条记忆会劈成两条）；未闭合的代码围栏
+会自动补上收尾，否则它会把当天后面所有条目都吞成代码。代码块（```）里的
+`##` 保持原样，不会被误解析。
 
 同一个标题写两次时，写入发生在**它原来所在的那个文件**里；`bucket: "curated"`
 会把日志里的同名条目搬到 `MEMORY.md`，不会留下两份。
@@ -274,6 +277,7 @@ your-repo/
 ├── mcp/
 │   └── memory_server.py                       # 零依赖记忆 server
 └── .copilot/
+    ├── .locks/                                 # 写入互斥锁（运行时生成）
     └── memory/
         ├── MEMORY.md                           # 长期沉淀的记忆（安装时就有）
         └── 2026-10-22.md                       # 首次写入后才会出现的当天日志
@@ -306,8 +310,8 @@ VS Code 里 `Ctrl+Shift+P` → `MCP: List Servers` → 找到 `memory` → start
 |---|---|
 | `memory_search(query, limit, scope, since, until)` | 按关键词检索，标题命中权重 3x、标签 1x、正文 0.5x；中文按字 + 二元组切分；可按日期区间过滤（`since`/`until` 只收 `YYYY-MM-DD`，格式不对直接报错） |
 | `memory_write(title, content, tags, scope, bucket)` | 写入/更新一条记忆，同标题自动原位更新；`bucket` 选 `daily`（默认）或 `curated`（会把同名日志条目迁移进 `MEMORY.md`） |
-| `memory_read(name, scope)` | 读全文；`name` 传日期（`2026-10-22`）可读出那天的全部记忆 |
-| `memory_list(scope, date, bucket)` | 列出全部，带预览；可按日期或 bucket 过滤 |
+| `memory_read(name, scope)` | 读全文；`name` 传日期（`2026-10-22`）可读出那天的全部记忆；`scope` 选 `project`（默认）/ `global` / `all` |
+| `memory_list(scope, date, bucket)` | 列出全部，带预览；可按日期或 bucket 过滤（日期不是 `YYYY-MM-DD`、bucket 不是 `daily`/`curated` 直接报错，不会静默忽略过滤条件） |
 | `memory_delete(name)` | 删除（仅在明确要求时用） |
 
 `scope` 参数在**仓库级**装法下不起实际作用（只有一层存储）；在**用户级**装法下
@@ -339,6 +343,7 @@ git commit -m "chore: add local memory layer for Copilot"
 ```gitignore
 .copilot/memory/*.md
 !.copilot/memory/MEMORY.md
+.copilot/.locks/
 ```
 
 ---
@@ -396,9 +401,10 @@ git commit -m "chore: add local memory layer for Copilot"
 （A 仓库看不到 B 仓库的记忆）、**已有用户配置的合并保留**、**卸载精确还原**、
 **JSONC（带注释）配置解析**、**按日期分文件的写入 / 原位更新 / 删除**、
 **旧格式 store 的读取**、**代码块内的 `##` 不被误解析**、**多进程并发写入不丢条目**、
-**超长标题不再撞同一文件**。
+**超长标题不再撞同一文件**、**未闭合围栏不再吞掉后续条目**、**标题含 `---` 不再截断 frontmatter**、
+**正文里的 `<!-- tags: -->` 不再被当元数据**、**锁文件不随 `TMPDIR` 漂移**。
 
-这些检查现在固定成 `tests/test_smoke.py`（28 个用例，仅标准库），跑一条命令即可：
+这些检查现在固定成 `tests/test_smoke.py`（37 个用例，仅标准库），跑一条命令即可：
 
 ```bash
 python3 tests/test_smoke.py

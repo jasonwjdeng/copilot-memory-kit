@@ -117,7 +117,14 @@ case before you trust the fix.
   would then rewrite a `global` memory that shares the title.
 - Writers take the store lock (`store_lock`) and replace files atomically.
   Several servers can share one store, and every write is a full
-  read-modify-write; without both, an interleaved pair loses an entry.
+  read-modify-write; without both, an interleaved pair loses an entry. The
+  lock file lives in `.locks/` beside the store, never in the temp
+  directory: `TMPDIR` differs between launch contexts (GUI, shell, cron), and
+  two temp paths mean two locks and no mutual exclusion at all.
+- In the dated layout one write must produce exactly one entry. A body line
+  starting with `##` is demoted to `###` and a dangling code fence is closed
+  on the way in; either one left alone lets a single memory swallow or split
+  into the entries around it.
 - Never delete user data as a side effect of housekeeping. Uninstall keeps
   the memory store unless `--purge` is passed; a parse failure aborts before
   anything is written.

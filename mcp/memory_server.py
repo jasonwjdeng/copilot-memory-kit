@@ -375,7 +375,7 @@ def split_doc(text: str) -> tuple[dict[str, Any], str]:
 
 def render_doc(title: str, body: str, tags: list[str]) -> str:
     # Local time with offset, like the dated entries: ``_doc_date`` trims the
-    # date off this stamp, and an UTC stamp filed a memory written at 01:00
+    # date off this stamp, and a UTC stamp filed a memory written at 01:00
     # +08:00 under the previous day.
     stamp = local_now_iso()
     tag_line = ", ".join(tags) if tags else ""
