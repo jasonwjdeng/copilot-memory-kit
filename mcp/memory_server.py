@@ -71,6 +71,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -83,7 +84,7 @@ from typing import Any
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "local-memory"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 
 SCOPE_PROJECT = "project"
 SCOPE_GLOBAL = "global"
@@ -826,48 +827,175 @@ def _partition_for(scope: str) -> tuple[Path, str]:
 # --------------------------------------------------------------------------
 # Search
 # --------------------------------------------------------------------------
+#
+# Ranking is BM25 over a term index. The previous counter scored raw keyword
+# occurrences (3x title + 1x tag + 0.5x body) with neither a document-length
+# normalisation nor any notion of how common a term is, and it took every
+# single CJK character as a term. Three failure modes came out of that, all
+# reproducible:
+#
+#   * a long note that repeats one word outranked the memory that answers the
+#     question -- a body with "database" twelve times beat a note that
+#     actually said "database migration";
+#   * one shared character was enough to pull in an unrelated memory, so
+#     "池化" matched "数据可视化" through 化, and "数据库" could not be told
+#     apart from "数据可视化";
+#   * "score" never matched "scored" or "scoring", "migration" never matched
+#     "migrations": ordinary English queries silently returned nothing.
+#
+# Terms are whole Latin words (suffix-folded) and CJK bigrams taken *inside*
+# one run of CJK characters. Bigrams never straddle a space, punctuation or a
+# Latin word: gluing every CJK character in the text together first invented
+# "本迁" out of "回滚脚本 迁移", which then matched "版本迁移".
+
+STOPWORDS = frozenset("""
+a an and are as at be been but by can for from had has have how if in into is
+it its of on or our that the their then there these they this to was were
+what when where which who why will with would you your
+""".split())
+
+# BM25 knobs. k1 controls term-frequency saturation, b how hard a long
+# document is penalised. The defaults are the usual ones; they are named
+# because a store that is mostly one-line rules and one that is mostly long
+# postmortems want different values.
+BM25_K1 = 1.2
+BM25_B = 0.75
+
+# A term in the title is worth this many occurrences of the same term in the
+# body, likewise a tag. Field weighting by repetition keeps a single term
+# index instead of three.
+TITLE_WEIGHT = 3
+TAG_WEIGHT = 2
+
+# A lone CJK character ("锁", "化") carries far less signal than a bigram, so
+# it counts for less when it is all a query gives us.
+WEAK_TERM_WEIGHT = 0.4
+
+# Hits this far below the best hit are dropped. Without a floor the tail of
+# every result list was noise: any single shared character scored above zero.
+# 0.40 also drops a memory that matched one word of a two-word query, which
+# is the case that made "database migration" list an unrelated ops note.
+RELATIVE_FLOOR = 0.40
+
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uf900-\ufaff]+")
+WORD_RE = re.compile(r"[a-z0-9]+")
+WORD_SEPARATOR_RE = re.compile(r"[_./\\-]+")
+
+
+def _is_weak(term: str) -> bool:
+    """True for a single CJK character: a weak, ambiguous query term."""
+    return len(term) == 1 and CJK_RE.match(term) is not None
+
+
+def _stem_variants(word: str) -> tuple[str, ...]:
+    """Fold the common English inflections onto one form.
+
+    Both the index and the query run through this, so agreement between the
+    two is what matters, not linguistic correctness. A stripped stem also
+    gets its ``e`` back, which is what lets "writing" and "write" meet in the
+    middle. Irregular forms ("wrote", "written") and derivations that change
+    the stem ("write" vs "writer") are still separate terms.
+    """
+    if len(word) <= 3 or not word.isalpha():
+        return (word,)
+    base = word
+    restored = False
+    if base.endswith("ies") and len(base) > 4:
+        base = base[:-3] + "y"
+    elif base.endswith("sses"):
+        base = base[:-2]
+    elif base.endswith(("xes", "zes", "ches", "shes", "ses")):
+        base = base[:-2]
+    elif base.endswith("s") and not base.endswith(("ss", "us", "is")):
+        base = base[:-1]
+    if base.endswith("ing") and len(base) > 5:
+        base, restored = base[:-3], True
+    elif base.endswith("ed") and len(base) > 4:
+        base, restored = base[:-2], True
+    elif base.endswith("er") and len(base) > 5:
+        # "writers" -> "writer" -> "write". Without this a query for "write"
+        # found nothing while "write" itself was a term: the agent verbs
+        # ("reader", "manager", "handler") all live one derivation away.
+        base, restored = base[:-2], True
+    if len(base) > 3 and base[-1] == base[-2] and base[-1] not in "lssz":
+        base = base[:-1]  # running -> runn -> run
+    if not base:
+        return (word,)
+    return (base, base + "e") if restored else (base,)
+
+
+def term_units(text: str, unigrams: bool = False) -> list[list[str]]:
+    """Split text into units, each carrying the terms it contributes.
+
+    A unit is one Latin word or one run of CJK characters. Keeping the units
+    lets the caller ask "how much of the query did this memory actually
+    cover", which is what stops a document that matches a single word from
+    outranking one that matches the whole phrase.
+
+    ``unigrams`` adds every CJK character of a run as well as its bigrams.
+    The index asks for them so that a one-character query ("锁") still finds
+    the note that says "锁文件路径"; a query does not, because expanding
+    "池化" into 池 + 化 is exactly what made it match "数据可视化".
+    """
+    text = unicodedata.normalize("NFKC", str(text or "")).lower()
+    text = WORD_SEPARATOR_RE.sub(" ", text)
+    units: list[list[str]] = []
+    for match in WORD_RE.finditer(text):
+        word = match.group(0)
+        if word in STOPWORDS:
+            continue
+        if len(word) < 2 and not word.isdigit():
+            continue
+        units.append(list(_stem_variants(word)))
+    for match in CJK_RE.finditer(text):
+        run = match.group(0)
+        if len(run) == 1:
+            units.append([run])
+            continue
+        units.append([run[i:i + 2] for i in range(len(run) - 1)])
+        if unigrams:
+            units.append(list(run))
+    return units
+
 
 def tokenize(text: str) -> list[str]:
-    """Split into comparable units.
+    """Every term this text contributes, in order. Debug aid for a store."""
+    return [term for unit in term_units(text) for term in unit]
 
-    Latin words are lowercased whole words. CJK is split per character AND
-    into 2-grams, because CJK has no word boundaries and single characters
-    carry too little signal for a relevant hit.
+
+def _squash(text: str) -> str:
+    """Whitespace-free, case-folded text, for phrase containment checks."""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(text or "")).lower())
+
+
+def _phrase_bonus(query: str, title: str, body: str) -> float:
+    """Reward a memory that contains the query as a phrase, not a bag of words.
+
+    BM25 alone cannot express "these words next to each other": a note that
+    merely mentions the same two words anywhere ranks alongside one titled
+    with them. Whitespace is squashed so "数据库 迁移" still matches
+    "数据库迁移".
     """
-    text = unicodedata.normalize("NFKC", text).lower()
-    tokens: list[str] = []
-    for match in re.finditer(r"[a-z0-9_]+", text):
-        tokens.append(match.group(0))
-    cjk = re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", text)
-    tokens.extend(cjk)
-    cjk_seq = "".join(cjk)
-    tokens.extend(cjk_seq[i:i + 2] for i in range(len(cjk_seq) - 1))
-    return tokens
-
-
-def score(query: str, title: str, body: str, tags: list[str]) -> float:
-    q_tokens = set(tokenize(query))
-    if not q_tokens:
+    needle = _squash(query)
+    if len(needle) < 2:
         return 0.0
-    title_tokens = tokenize(title)
-    body_tokens = tokenize(body)
-    tag_tokens = tokenize(" ".join(tags))
+    if needle in _squash(title):
+        return 3.0
+    if len(body) <= 20000 and needle in _squash(body):
+        return 1.5
+    return 0.0
 
-    def hits(tokens: list[str]) -> int:
-        if not tokens:
-            return 0
-        bucket: dict[str, int] = {}
-        for tok in tokens:
-            bucket[tok] = bucket.get(tok, 0) + 1
-        return sum(bucket.get(q, 0) for q in q_tokens)
 
-    total = (
-        3.0 * hits(title_tokens)
-        + 1.0 * hits(tag_tokens)
-        + 0.5 * hits(body_tokens)
-    )
-    # Normalise by query size so long queries do not automatically win.
-    return total / (len(q_tokens) ** 0.5)
+def doc_terms(doc: dict[str, Any]) -> dict[str, int]:
+    """Field-weighted term frequencies for one memory."""
+    counts: dict[str, int] = {}
+    for field, weight in ((doc.get("title", ""), TITLE_WEIGHT),
+                          (" ".join(doc.get("tags", [])), TAG_WEIGHT),
+                          (doc.get("body", ""), 1)):
+        for unit in term_units(field, unigrams=True):
+            for term in unit:
+                counts[term] = counts.get(term, 0) + weight
+    return counts
 
 
 def _doc_date(doc: dict[str, Any]) -> str:
@@ -877,49 +1005,155 @@ def _doc_date(doc: dict[str, Any]) -> str:
     return updated[:10] if updated else ""
 
 
+def _dedupe_key(doc: dict[str, Any]) -> str:
+    """Group memories that record the same fact twice.
+
+    Writing the same rule on three consecutive days left three entries with
+    near-identical titles, and search returned all three at the top -- five
+    slots spent on one fact. An identical body is the same fact regardless of
+    the title, so that is the key; a short body falls back to the title slug
+    because two one-word bodies matching by accident is more likely than two
+    memories truly duplicating a ten-character note.
+    """
+    body = re.sub(r"\s+", " ", doc.get("body", "")).strip().lower()
+    if len(body) >= 24:
+        return hashlib.sha1(body.encode("utf-8")).hexdigest()
+    return slugify(doc.get("title", ""))
+
+
 def search_memories(query: str, limit: int = 5, scope: str = SCOPE_PROJECT,
                     since: str = "", until: str = "") -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+    """Rank memories against ``query`` with BM25 plus a phrase bonus."""
+    query = str(query or "")
+    units = term_units(query)
+    q_terms = {term for unit in units for term in unit}
+    if not q_terms:
+        # A query made only of stopwords ("the", "how") carries no signal.
+        # Returning the whole store for it looked like a working search.
+        return []
+
+    dated: list[tuple[dict[str, Any], str]] = []
     for doc in collect_docs(scope):
         date = _doc_date(doc)
-        if since and date and date < since:
+        if since or until:
+            # A memory with no usable date cannot satisfy a date range.
+            # Skipping the check instead let undated notes through a filter
+            # that explicitly excluded them.
+            if not date:
+                continue
+            if since and date < since:
+                continue
+            if until and date > until:
+                continue
+        dated.append((doc, date))
+    if not dated:
+        return []
+
+    indexed: list[tuple[dict[str, Any], str, dict[str, int], int]] = []
+    freq: dict[str, int] = {}
+    total_terms = 0
+    for doc, date in dated:
+        counts = doc_terms(doc)
+        length = sum(counts.values())
+        total_terms += length
+        for term in counts:
+            freq[term] = freq.get(term, 0) + 1
+        indexed.append((doc, date, counts, length))
+    total = len(indexed)
+    avgdl = (total_terms / total) or 1.0
+
+    scored: list[tuple[float, dict[str, Any], str]] = []
+    for doc, date, counts, length in indexed:
+        value = 0.0
+        matched = 0
+        for term in q_terms:
+            tf = counts.get(term, 0)
+            if not tf:
+                continue
+            seen = freq.get(term, 0)
+            idf = math.log(1.0 + (total - seen + 0.5) / (seen + 0.5))
+            weight = WEAK_TERM_WEIGHT if _is_weak(term) else 1.0
+            value += (weight * idf * tf * (BM25_K1 + 1)
+                      / (tf + BM25_K1 * (1 - BM25_B + BM25_B * length / avgdl)))
+            matched += 1
+        if not matched:
             continue
-        if until and date and date > until:
+        covered = sum(1 for unit in units if any(counts.get(term) for term in unit))
+        coverage = covered / len(units)
+        value = value * (0.5 + 0.5 * coverage)
+        value += _phrase_bonus(query, doc.get("title", ""), doc.get("body", ""))
+        scored.append((value, doc, date))
+
+    if not scored:
+        return []
+    # Newest wins a tie, then the stable sort keeps file order.
+    scored.sort(key=lambda item: item[2], reverse=True)
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    floor = scored[0][0] * RELATIVE_FLOOR
+    results: list[dict[str, Any]] = []
+    by_key: dict[str, dict[str, Any]] = {}
+    for value, doc, date in scored:
+        if value < floor:
+            break
+        key = _dedupe_key(doc)
+        if key in by_key:
+            by_key[key]["also"].append(doc.get("title", doc["name"]))
             continue
-        s = score(query, doc.get("title", ""), doc.get("body", ""), doc.get("tags", []))
-        if s > 0:
-            results.append({
-                "name": doc["name"],
-                "title": doc.get("title", doc["name"]),
-                "tags": doc.get("tags", []),
-                "updated": doc.get("updated", ""),
-                "date": date,
-                "bucket": doc.get("bucket", ""),
-                "scope": doc.get("scope", ""),
-                "score": round(s, 3),
-                "excerpt": excerpt_around(doc.get("body", ""), query),
-                "path": doc.get("path", ""),
-            })
-    results.sort(key=lambda r: r["score"], reverse=True)
-    return results[:limit]
+        item = {
+            "name": doc["name"],
+            "title": doc.get("title", doc["name"]),
+            "tags": doc.get("tags", []),
+            "updated": doc.get("updated", ""),
+            "date": date,
+            "bucket": doc.get("bucket", ""),
+            "scope": doc.get("scope", ""),
+            "score": round(value, 3),
+            "excerpt": excerpt_around(doc.get("body", ""), query),
+            "path": doc.get("path", ""),
+            "also": [],
+        }
+        by_key[key] = item
+        results.append(item)
+        if len(results) >= limit:
+            break
+    return results
 
 
 def excerpt_around(body: str, query: str, width: int = 220) -> str:
-    """Return a window of body text centred on the first query hit."""
+    """Return the window of body text that holds the densest query matches.
+
+    Anchoring on the first single character that happened to appear put the
+    snippet on an unrelated sentence: the old token list began with lone CJK
+    characters, so "缓存" centred on the 本 of "本项目" instead of the
+    paragraph that talks about caching.
+    """
     if not body:
         return ""
-    q_tokens = tokenize(query)
-    lowered = body.lower()
-    pos = -1
-    for tok in q_tokens:
-        if len(tok) < 2 and not re.match(r"[\u4e00-\u9fff\u3040-\u30ff]", tok):
-            continue
-        pos = lowered.find(tok.lower())
-        if pos != -1:
-            break
-    if pos == -1:
+    terms = [term for unit in term_units(query) for term in unit if not _is_weak(term)]
+    if not terms:
+        terms = tokenize(query)
+    if not terms:
         return body[:width].replace("\n", " ").strip()
-    start = max(0, pos - width // 3)
+
+    lowered = body.lower()
+    best_pos, best_score = -1, 0
+    for term in terms[:12]:
+        start = 0
+        for _ in range(40):  # a very common term must not scan the whole body
+            pos = lowered.find(term, start)
+            if pos < 0:
+                break
+            window = lowered[max(0, pos - width // 3):pos + width]
+            hits = sum(1 for candidate in terms if candidate in window)
+            if hits > best_score:
+                best_pos, best_score = pos, hits
+            start = pos + 1
+        if best_score == len(terms):
+            break
+    if best_pos < 0:
+        return body[:width].replace("\n", " ").strip()
+    start = max(0, best_pos - width // 3)
     end = min(len(body), start + width)
     snippet = body[start:end].replace("\n", " ").strip()
     if start > 0:
@@ -1237,8 +1471,8 @@ TOOLS = [
                     "enum": [SCOPE_PROJECT, SCOPE_GLOBAL, SCOPE_ALL],
                     "description": "Which memories to search. Default 'project'.",
                 },
-                "since": {"type": "string", "description": "Only memories dated on or after YYYY-MM-DD."},
-                "until": {"type": "string", "description": "Only memories dated on or before YYYY-MM-DD."},
+                "since": {"type": "string", "description": "Only memories dated on or after YYYY-MM-DD. Memories with no date are excluded."},
+                "until": {"type": "string", "description": "Only memories dated on or before YYYY-MM-DD. Memories with no date are excluded."},
             },
             "required": ["query"],
         },

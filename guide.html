@@ -288,7 +288,7 @@
 <table>
   <thead><tr><th>工具</th><th>作用</th></tr></thead>
   <tbody>
-    <tr><td><code>memory_search(query, limit, scope, since, until)</code></td><td>关键词检索；标题命中权重 3×、标签 1×、正文 0.5×；中文按字 + 二元组切分；可按日期区间过滤</td></tr>
+    <tr><td><code>memory_search(query, limit, scope, since, until)</code></td><td>BM25 排序（带长度归一化与词频饱和）+ 短语加成；标题词 3×、标签 2×、正文 1×；英文做词形折叠（score / scored / scoring 同词），中文只在连续汉字串内切二元组、不跨空格标点；重复内容合并、低于最高分 40% 的结果丢弃；可按日期区间过滤</td></tr>
     <tr><td><code>memory_write(title, content, tags, scope, bucket)</code></td><td>写入或更新一条记忆，同标题自动原位更新；<code>bucket</code> 选 <code>daily</code>（默认）或 <code>curated</code></td></tr>
     <tr><td><code>memory_read(name, scope)</code></td><td>读全文；<code>name</code> 传日期（<code>2026-10-22</code>）可读出那天的全部记忆</td></tr>
     <tr><td><code>memory_list(scope, date, bucket)</code></td><td>列出全部，带预览；可按日期或 bucket 过滤</td></tr>
@@ -319,7 +319,7 @@
 <h2>六、公司电脑特有注意事项</h2>
 <ol>
   <li><strong>不能装东西</strong> — 本方案只依赖系统自带 python3，无需 pip install。Windows 上 <code>install_user.py</code> 会自动找 <code>python.exe</code> 或 <code>py</code> 启动器下的解释器，找不到就用 <code>--python</code> 手动指定；macOS/Linux 上 <code>/usr/bin/python3</code> 即可。</li>
-  <li><strong>不能联网</strong> — 记忆 server 完全离线；<code>memory_search</code> 是本地关键词检索，不调用 embedding API。</li>
+  <li><strong>不能联网</strong> — 记忆 server 完全离线；<code>memory_search</code> 是本地 BM25 检索，不调用 embedding API。</li>
   <li><strong>MCP 审批</strong> — 首次调用工具会弹权限确认，选「Always allow」避免每次都点。</li>
   <li><strong>企业策略可能禁用 MCP</strong> — 若 <code>MCP: List Servers</code> 看不到 server，退回纯文件方案：让 Copilot 直接用内置 <code>read_file</code> / <code>edit_file</code> 读写 <code>~/.copilot/memory/</code> 下的 Markdown，指令文件里已写了这条降级路径。</li>
   <li><strong>仓库不能提交</strong> — 把 <code>MEMORY_ROOT</code> 指到仓库外，例如 <code>~/copilot-memories/&lt;repo-name&gt;</code>，改 MCP 配置的 <code>env</code> 即可。</li>

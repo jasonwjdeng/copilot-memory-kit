@@ -130,6 +130,12 @@ case before you trust the fix.
   anything is written.
 - Both installers are idempotent and never delete user content they did
   not create.
+- Search ranks with BM25 plus a phrase bonus (`mcp/memory_server.py`, the
+  `Search` section knobs). Keep the term model: Latin words folded onto one
+  stem, CJK bigrams taken only inside a run of CJK characters, no single
+  character as a term unless the query itself is one character. Counting raw
+  keyword occurrences instead reintroduces the bug where a long note that
+  repeats a word outranks the memory that answers the question.
 
 ## Before committing
 

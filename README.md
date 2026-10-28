@@ -308,7 +308,7 @@ VS Code 里 `Ctrl+Shift+P` → `MCP: List Servers` → 找到 `memory` → start
 
 | 工具 | 作用 |
 |---|---|
-| `memory_search(query, limit, scope, since, until)` | 按关键词检索，标题命中权重 3x、标签 1x、正文 0.5x；中文按字 + 二元组切分；可按日期区间过滤（`since`/`until` 只收 `YYYY-MM-DD`，格式不对直接报错） |
+| `memory_search(query, limit, scope, since, until)` | BM25 排序（含文档长度归一化与词频饱和）+ 短语命中加成；标题词按 3 倍计入、标签 2 倍、正文 1 倍；英文按词做词形折叠（`score`/`scored`/`scoring` 视为同一词），中文只在连续汉字串内切二元组、不跨空格或标点；内容重复的记忆会合并，命中的其余标题放在 `also`；低于最高分 40% 的结果直接丢弃。可按日期区间过滤（`since`/`until` 只收 `YYYY-MM-DD`，格式不对直接报错，无日期的记忆不参与区间过滤） |
 | `memory_write(title, content, tags, scope, bucket)` | 写入/更新一条记忆，同标题自动原位更新；`bucket` 选 `daily`（默认）或 `curated`（会把同名日志条目迁移进 `MEMORY.md`） |
 | `memory_read(name, scope)` | 读全文；`name` 传日期（`2026-10-22`）可读出那天的全部记忆；`scope` 选 `project`（默认）/ `global` / `all` |
 | `memory_list(scope, date, bucket)` | 列出全部，带预览；可按日期或 bucket 过滤（日期不是 `YYYY-MM-DD`、bucket 不是 `daily`/`curated` 直接报错，不会静默忽略过滤条件） |
@@ -368,7 +368,7 @@ git commit -m "chore: add local memory layer for Copilot"
    - Windows：`install_user.py` 会自动找 `python.exe` / `py` 启动器下的解释器，
      找不到就用 `--python` 手动指定。
    - macOS/Linux：`/usr/bin/python3` 即可。
-2. **不能联网** → 记忆 server 完全离线；`memory_search` 是本地关键词检索，不调用 embedding API。
+2. **不能联网** → 记忆 server 完全离线；`memory_search` 是本地 BM25 检索，不调用 embedding API。
 3. **MCP 审批** → 首次调用工具时 VS Code 会弹权限确认，选「Always allow」避免每次都点。
 4. **企业策略可能禁用 MCP** → 若 `MCP: List Servers` 看不到你的 server，或被策略拦截，
    退回到纯文件方案：让 Copilot 直接用内置 `read_file` / `edit_file` 读写

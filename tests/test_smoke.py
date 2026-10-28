@@ -28,7 +28,15 @@ Every test here exists because the corresponding bug shipped once:
 * ``memory_list`` silently ignored an unparseable ``date`` filter;
 * ``memory_read`` ignored its ``scope`` argument;
 * a ``##`` line in a body split one memory into two;
-* file-mode stamps were UTC while dated stamps were local.
+* file-mode stamps were UTC while dated stamps were local;
+* search scored raw keyword counts, so a long note that repeated one word
+  outranked the memory that answered the question;
+* every CJK character was a search term, so "池化" matched "数据可视化";
+* CJK bigrams were built across spaces, inventing "本迁" from "回滚脚本 迁移";
+* "score" never matched "scored", "migration" never matched "migrations";
+* the same fact recorded on three days filled three result slots;
+* a date filter let undated memories through;
+* a query made only of stopwords listed the whole store.
 """
 
 from __future__ import annotations
@@ -645,6 +653,134 @@ class InstallerTest(unittest.TestCase):
     def test_purge_requires_uninstall(self) -> None:
         result = self.install("--purge")
         self.assertEqual(result.returncode, 2)
+
+
+class SearchRankingTest(unittest.TestCase):
+    """How memory_search ranks.
+
+    Called in-process rather than over stdio: a ranking case needs a handful
+    of memories and several queries, and a subprocess per call made the
+    suite slow enough that ranking cases would not get written.
+
+    Every case here is a query the counter-based scorer got wrong -- it
+    matched raw keyword occurrences with no term weighting, no document
+    length normalisation and every CJK character as a term.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="memkit-rank-"))
+        self.store = self.tmp / "store"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("MEMORY_")}
+        self.env.update({
+            "MEMORY_ROOT": str(self.store),
+            "MEMORY_LAYOUT": "flat",
+            "MEMORY_ORGANIZE": "dated",
+        })
+        sys.path.insert(0, str(SERVER.parent))
+        try:
+            import memory_server
+        finally:
+            sys.path.pop(0)
+        self.ms = memory_server
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- helpers ---------------------------------------------------------
+    def remember(self, title: str, body: str, tags: list[str] | None = None,
+                 date: str = "2026-10-20") -> None:
+        path = self.store / f"{date}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(os.environ, self.env):
+            self.ms.append_entry(path, title, body, tags or [],
+                                 f"{date}T10:00:00+08:00", header=f"# {date}\n")
+
+    def search(self, query: str, **arguments) -> list[dict]:
+        with mock.patch.dict(os.environ, self.env):
+            reply = self.ms.tool_memory_search(query, **arguments)
+        self.assertFalse(reply["isError"], reply)
+        return json.loads(reply["content"][0]["text"])
+
+    def titles(self, query: str, **arguments) -> list[str]:
+        return [hit["title"] for hit in self.search(query, **arguments)]
+
+    # -- tests -----------------------------------------------------------
+    def test_search_folds_english_inflections(self) -> None:
+        # "score" returned nothing while the store said "scored"; "write"
+        # returned nothing while the store said "Writers".
+        self.remember("Scoring rules", "Documents are scored, then ranked.")
+        self.remember("Writers must lock", "The writer takes the lock.")
+
+        for query in ("score", "scored", "scoring"):
+            self.assertEqual(self.titles(query), ["Scoring rules"], query)
+        for query in ("write", "writers"):
+            self.assertEqual(self.titles(query), ["Writers must lock"], query)
+
+    def test_search_bigram_does_not_cross_a_space(self) -> None:
+        # Gluing every CJK character in the text together invented "本迁" out
+        # of "回滚脚本 迁移", which then matched "版本迁移".
+        self.remember("版本迁移记录", "这次改动涉及版本迁移。")
+        self.remember("脚本位置", "迁移脚本放在 tools 下。")
+
+        self.assertEqual(self.titles("本迁"), ["版本迁移记录"])
+        self.assertEqual(self.titles("滚脚"), [])
+
+    def test_query_characters_are_not_terms_on_their_own(self) -> None:
+        # Querying "池化" matched "数据可视化" through the shared character 化,
+        # and "数据库" could not be told apart from "数据可视化".
+        self.remember("数据库迁移", "迁移脚本要配套回滚。")
+        self.remember("数据可视化主题", "图表配色要对比度足够。")
+        self.remember("池化配置", "连接池默认 10。")
+
+        self.assertEqual(self.titles("池化"), ["池化配置"])
+        self.assertEqual(self.titles("数据库"), ["数据库迁移"])
+
+    def test_single_character_query_still_matches(self) -> None:
+        # Dropping unigrams outright would have made a one-character query
+        # useless; the index keeps them at a reduced weight.
+        self.remember("锁文件路径", "TMPDIR 不同，锁要放在库旁边。")
+        self.remember("UI 主题", "浅色主题下不要用深色面板。")
+
+        self.assertEqual(self.titles("锁"), ["锁文件路径"])
+
+    def test_phrase_beats_repetition_and_length(self) -> None:
+        # A long note that repeats "database" twelve times outranked the note
+        # that actually said "database migration".
+        self.remember("Long ops notes", "database " * 12)
+        self.remember("数据库迁移流程", "database migration steps: dump, verify.")
+
+        for query in ("database migration", "migration database"):
+            self.assertEqual(self.titles(query)[0], "数据库迁移流程", query)
+
+    def test_duplicate_facts_are_collapsed(self) -> None:
+        # The same rule recorded on three days occupied the top of every
+        # result list three times over.
+        body = "Commit messages are written in English."
+        for day in ("2026-10-18", "2026-10-19", "2026-10-20"):
+            self.remember(f"提交信息用英文 {day}", body, date=day)
+
+        hits = self.search("commit messages english")
+        self.assertEqual(len(hits), 1, hits)
+        self.assertEqual(len(hits[0]["also"]), 2, hits[0])
+
+    def test_date_filter_excludes_undated_memories(self) -> None:
+        # The filter skipped its own comparison when a memory had no date, so
+        # an undated note came back from a range that excluded it.
+        self.remember("dated note", "a dated body", date="2026-10-20")
+        legacy = self.store / "old-note.md"
+        legacy.write_text("---\ntitle: legacy note\n---\n\nno updated field\n",
+                          encoding="utf-8")
+
+        self.assertIn("legacy note", self.titles("note"))
+        self.assertEqual(self.titles("note", since="2026-10-19"), ["dated note"])
+
+    def test_stopword_query_returns_nothing(self) -> None:
+        # "the" was a term, so a query made of stopwords listed the store.
+        self.remember("Some rule", "the body has the words in it")
+
+        self.assertEqual(self.titles("the"), [])
+        self.assertEqual(self.titles("how do i"), [])
 
 
 if __name__ == "__main__":
