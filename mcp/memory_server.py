@@ -77,13 +77,13 @@ import sys
 import tempfile
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "local-memory"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 
 SCOPE_PROJECT = "project"
 SCOPE_GLOBAL = "global"
@@ -179,9 +179,17 @@ def lock_path() -> Path:
     """Advisory lock file for this store, kept out of the store itself.
 
     Two VS Code windows -- or VS Code plus another agent -- can share one
-    store, and each write is a read-modify-write of a whole file. Parking the
-    lock next to the memories would put a `.lock` file in the user's repo,
-    so it lives in the temp directory under a digest of the store path.
+    store, and each write is a read-modify-write of a whole file.
+
+    The lock lives beside the store, not in the temp directory. ``tempfile``
+    honours ``TMPDIR``, so two processes started with different values (GUI
+    launch, a test harness, a cron job) locked two different files and both
+    believed they held the store -- mutual exclusion failed silently. The OS
+    also sweeps the temp directory, which can delete a lock a live process
+    still holds. Deriving the path from the store makes the mapping
+    store <-> lock absolute; the digest keeps one lock per store, and
+    ``.locks`` is a dot-directory so it can never be read as a memory
+    (the store only reads ``*.md``).
     """
     root = memory_root()
     try:
@@ -189,7 +197,7 @@ def lock_path() -> Path:
     except OSError:
         key = str(root)
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    return Path(tempfile.gettempdir()) / f"copilot-memory-{digest}.lock"
+    return root.parent / ".locks" / f"memory-{digest}.lock"
 
 
 def _lock(fd: int) -> None:
@@ -222,6 +230,7 @@ def store_lock(timeout: float = LOCK_TIMEOUT):
     write and is returned to the caller as a tool error.
     """
     path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
 
     acquired = False
@@ -256,6 +265,19 @@ def locked(func):
         except OSError as exc:
             return _failed(f"Could not write memory: {exc}")
     return wrapper
+
+
+# --------------------------------------------------------------------------
+# Time
+# --------------------------------------------------------------------------
+
+def local_now_iso() -> str:
+    """Local time with offset -- a diary entry belongs to a local day."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def local_date() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 # --------------------------------------------------------------------------
@@ -320,16 +342,24 @@ def slugify(title: str) -> str:
 
 
 def split_doc(text: str) -> tuple[dict[str, Any], str]:
-    """Parse the optional YAML-ish frontmatter into a dict + body."""
+    """Parse the optional YAML-ish frontmatter into a dict + body.
+
+    The delimiters are matched as whole lines. Splitting on the substring
+    ``---`` treated the ``---`` inside a title (``title: A---B``) as the end
+    of the header, so the memory came back with a truncated title and a body
+    made of leftover header text.
+    """
     meta: dict[str, Any] = {}
-    body = text
-    if not text.startswith("---"):
-        return meta, body
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return meta, body
-    header, body = parts[1], parts[2].lstrip("\n")
-    for line in header.splitlines():
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return meta, text
+    close = next((index for index in range(1, len(lines))
+                  if lines[index].strip() == "---"), None)
+    if close is None:
+        return meta, text
+    header = lines[1:close]
+    body = "\n".join(lines[close + 1:]).lstrip("\n")
+    for line in header:
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
@@ -344,7 +374,10 @@ def split_doc(text: str) -> tuple[dict[str, Any], str]:
 
 
 def render_doc(title: str, body: str, tags: list[str]) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Local time with offset, like the dated entries: ``_doc_date`` trims the
+    # date off this stamp, and an UTC stamp filed a memory written at 01:00
+    # +08:00 under the previous day.
+    stamp = local_now_iso()
     tag_line = ", ".join(tags) if tags else ""
     return (f"---\ntitle: {normalize_title(title)}\ntags: [{tag_line}]\n"
             f"updated: {stamp}\n---\n\n{body.rstrip()}\n")
@@ -362,13 +395,41 @@ def read_doc(path: Path) -> dict[str, Any]:
 # Dated entries: parse / render / write
 # --------------------------------------------------------------------------
 
-def local_now_iso() -> str:
-    """Local time with offset -- a diary entry belongs to a local day."""
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+BODY_ENTRY_RE = re.compile(r"^##[ \t]+")
 
 
-def local_date() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+def _prepare_body(body: str) -> str:
+    """Make a body safe to drop into a dated file.
+
+    Two things a body can carry would corrupt the file it is written into:
+
+    * a line starting with ``##`` opens a new entry when the file is parsed,
+      so Markdown pasted into a memory split one memory into two;
+    * an odd number of fence markers leaves a fence open, and every line
+      after it -- including every later entry in that day's log -- was
+      parsed as code, so the entries vanished from ``list`` and ``read``
+      while the write still reported success.
+
+    Headings are demoted one level and an open fence is closed. Lines inside
+    a fence are kept exactly as written.
+    """
+    text = (body or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    fence: str | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if fence is None:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence = stripped[:3]
+            elif BODY_ENTRY_RE.match(line):
+                lines[index] = "### " + line[2:].lstrip()
+        elif stripped.startswith(fence):
+            fence = None
+    if fence is not None:
+        lines.append(fence)
+    return "\n".join(lines)
 
 
 def render_entry(title: str, body: str, tags: list[str], updated: str) -> str:
@@ -379,44 +440,67 @@ def render_entry(title: str, body: str, tags: list[str], updated: str) -> str:
     if updated:
         lines.append(f"<!-- updated: {updated} -->")
     lines.append("")
-    lines.append((body or "").strip())
+    lines.append(_prepare_body(body))
     lines.append("")
     # Trailing blank line so the next entry starts after a real gap.
     return "\n".join(lines) + "\n"
 
 
 def _extract_meta(section: str) -> tuple[list[str], str, str]:
-    """Pull tags / updated out of the meta comments, return clean body."""
+    """Pull tags / updated out of the meta comments, return clean body.
+
+    Only the comment block directly under the heading is metadata. Stripping
+    every ``<!-- tags: ... -->`` in the section also ate such a comment out
+    of the body text and invented a tag the writer never passed.
+    """
     tags: list[str] = []
     updated = ""
-    for match in META_COMMENT_RE.finditer(section):
-        key = match.group(1).lower()
+    lines = section.splitlines()
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    consumed = 0
+    while index < len(lines):
+        match = META_COMMENT_RE.fullmatch(lines[index].strip())
+        if match is None:
+            break
         value = match.group(2).strip()
-        if key == "tags":
+        if match.group(1).lower() == "tags":
             tags = [t.strip() for t in value.split(",") if t.strip()]
-        elif key == "updated":
+        else:
             updated = value
-    body = META_COMMENT_RE.sub("", section)
-    return tags, updated, body.strip()
+        index += 1
+        consumed += 1
+    if not consumed:
+        return tags, updated, section.strip()
+    return tags, updated, "\n".join(lines[index:]).strip()
 
 
 def _fenced_lines(text: str) -> set[int]:
     """Line numbers (0-based) that sit inside a fenced code block.
 
     A ``##`` heading inside a code fence is documentation, not an entry.
+    A fence that is never closed is a typo rather than a container: treating
+    the rest of the file as code hid every later entry (writes reported
+    success while the memory was unreachable), so an unterminated fence is
+    ignored and its headings stay visible.
     """
     inside: set[int] = set()
     fence: str | None = None
+    opened_at = -1
     for number, line in enumerate(text.splitlines()):
         stripped = line.strip()
         if fence is None:
             if stripped.startswith("```") or stripped.startswith("~~~"):
                 fence = stripped[:3]
+                opened_at = number
                 inside.add(number)
             continue
         inside.add(number)
         if stripped.startswith(fence):
             fence = None
+    if fence is not None:
+        inside = {number for number in inside if number < opened_at}
     return inside
 
 
@@ -475,10 +559,15 @@ def _legacy_docs(path: Path, label: str) -> list[dict[str, Any]]:
 
 
 def _is_legacy_file(path: Path) -> bool:
-    """True when a file uses the frontmatter (one memory per file) format."""
+    """True when a file uses the frontmatter (one memory per file) format.
+
+    The opening delimiter must be a line of its own -- a file that merely
+    starts with ``---`` is a dated log whose first entry happened to begin
+    with a horizontal rule, not a frontmatter document.
+    """
     try:
         with path.open("r", encoding="utf-8") as handle:
-            return handle.read(4).lstrip().startswith("---")
+            return handle.readline().strip() == "---"
     except OSError:
         return False
 
@@ -993,12 +1082,12 @@ def tool_memory_write(title: str, content: str, tags: list[str] | None = None,
                    label, "", "", path)
 
 
-def _locate(name: str) -> dict[str, Any] | None:
-    """Find a memory by title. Project scope wins over global scope."""
+def _locate(name: str, scope: str = SCOPE_PROJECT) -> dict[str, Any] | None:
+    """Find a memory by title inside ``scope``. Exact title wins over slug."""
     target = normalize_title(name)
     target_slug = slugify(target)
     fallback = None
-    for doc in collect_docs(SCOPE_PROJECT):
+    for doc in collect_docs(scope):
         if normalize_title(doc.get("title", "")) == target:
             return doc
         if fallback is None and slugify(doc.get("title", "")) == target_slug:
@@ -1008,8 +1097,9 @@ def _locate(name: str) -> dict[str, Any] | None:
 
 def tool_memory_read(name: str, scope: str = SCOPE_PROJECT) -> dict[str, Any]:
     target = normalize_title(name)
+    scope = _normalize_scope(scope)
     if DATE_FILE_RE.match(target):
-        docs = [d for d in collect_docs(_normalize_scope(scope)) if d.get("date") == target]
+        docs = [d for d in collect_docs(scope) if d.get("date") == target]
         if docs:
             return {
                 "content": [{
@@ -1033,12 +1123,7 @@ def tool_memory_read(name: str, scope: str = SCOPE_PROJECT) -> dict[str, Any]:
                 }],
                 "isError": False,
             }
-    doc = _locate(target)
-    if doc is None and _normalize_scope(scope) == SCOPE_ALL:
-        for candidate in collect_docs(SCOPE_ALL):
-            if normalize_title(candidate.get("title", "")) == target:
-                doc = candidate
-                break
+    doc = _locate(target, scope)
     if doc is None:
         return _failed(f"No memory named '{name}'.")
     return {
@@ -1052,8 +1137,16 @@ def tool_memory_read(name: str, scope: str = SCOPE_PROJECT) -> dict[str, Any]:
 
 def tool_memory_list(scope: str = SCOPE_PROJECT, date: str = "",
                      bucket: str = "") -> dict[str, Any]:
-    date = as_date(date)
-    bucket = _normalize_bucket(bucket) if str(bucket or "").strip() else ""
+    # A filter that cannot be understood is an error, not a silent widening:
+    # ``date="2026/01/01"`` used to drop the filter and list everything, which
+    # reads as "nothing matched that day" when it means "bad argument".
+    date = str(date or "").strip()
+    if date and not as_date(date):
+        return _failed(f"'date' must be YYYY-MM-DD, got {date!r}.")
+    bucket = str(bucket or "").strip().lower()
+    if bucket and bucket not in (BUCKET_DAILY, BUCKET_CURATED):
+        return _failed(
+            f"'bucket' must be '{BUCKET_DAILY}' or '{BUCKET_CURATED}', got {bucket!r}.")
     items = []
     for doc in collect_docs(_normalize_scope(scope)):
         if date and _doc_date(doc) != date:
@@ -1120,7 +1213,9 @@ SCOPE_NOTE = (
 ORGANIZE_NOTE = (
     "In dated mode each memory lives in a per-day file (or the curated "
     "MEMORY.md) as a level-2 heading; write to today's log by default and "
-    "use bucket 'curated' for long-lived facts."
+    "use bucket 'curated' for long-lived facts. A body line that starts with "
+    "'## ' is demoted to '### ' (and a dangling code fence is closed) so one "
+    "memory can never split into or swallow another."
 )
 
 TOOLS = [
@@ -1182,7 +1277,7 @@ TOOLS = [
         "name": "memory_read",
         "description": (
             "Read one memory in full by title. Passing a date (YYYY-MM-DD) "
-            "returns every memory recorded that day."
+            "returns every memory recorded that day. " + SCOPE_NOTE
         ),
         "inputSchema": {
             "type": "object",
@@ -1190,8 +1285,8 @@ TOOLS = [
                 "name": {"type": "string"},
                 "scope": {
                     "type": "string",
-                    "enum": [SCOPE_PROJECT, SCOPE_ALL],
-                    "description": "Default 'project'.",
+                    "enum": [SCOPE_PROJECT, SCOPE_GLOBAL, SCOPE_ALL],
+                    "description": "Which partition to read from. Default 'project'.",
                 },
             },
             "required": ["name"],

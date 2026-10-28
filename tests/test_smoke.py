@@ -20,7 +20,15 @@ Every test here exists because the corresponding bug shipped once:
 * lock open/timeout failures allowed a write to proceed without exclusivity;
 * different titles with the same slug overwrote one another;
 * deleting the last entry also deleted manual content in its daily file;
-* failed deletes were reported as successful.
+* failed deletes were reported as successful;
+* an unclosed code fence hid every later entry in the day's log;
+* ``---`` inside a title truncated the frontmatter parse;
+* a ``<!-- tags: -->`` line in the body was eaten and turned into a tag;
+* the lock file lived in the temp directory, so ``TMPDIR`` split it in two;
+* ``memory_list`` silently ignored an unparseable ``date`` filter;
+* ``memory_read`` ignored its ``scope`` argument;
+* a ``##`` line in a body split one memory into two;
+* file-mode stamps were UTC while dated stamps were local.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -333,6 +342,124 @@ class ServerTest(unittest.TestCase):
             stored = json.loads(tool_text(self.call("memory_read", name=title)))
             self.assertEqual(stored["title"], title)
             self.assertEqual(stored["body"], body)
+
+    # -- P0: an entry must never corrupt the file it lands in --------------
+    def test_unclosed_fence_does_not_swallow_later_entries(self) -> None:
+        self.write(title="entry with unclosed fence",
+                   content="see:\n\n```bash\necho hi")
+        self.write(title="second entry", content="must stay visible")
+
+        # The fence is closed on the way in, so the next entry is not code.
+        stored = json.loads(tool_text(self.call("memory_read", name="second entry")))
+        self.assertEqual(stored["body"], "must stay visible")
+        self.assertIn("```", Path(stored["path"]).read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 2)
+
+        # Re-writing the title updates in place instead of appending a copy.
+        self.write(title="second entry", content="must stay visible")
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 2)
+
+    def test_unclosed_fence_in_hand_edited_file_keeps_later_entries(self) -> None:
+        created = self.write(title="first", content="body")
+        daily = Path(created["path"])
+        daily.write_text(
+            "# 2026-10-28\n\n## first\n\n```\nno closing fence\n\n"
+            "## second\n\nmust still be an entry\n",
+            encoding="utf-8",
+        )
+
+        listed = json.loads(tool_text(self.call("memory_list")))
+        self.assertEqual([m["title"] for m in listed["memories"]], ["first", "second"])
+
+    def test_dashes_in_title_survive_frontmatter(self) -> None:
+        self.env["MEMORY_ORGANIZE"] = "file"
+        self.store = self.tmp / "store-file-dashes"
+        self.env["MEMORY_ROOT"] = str(self.store)
+        title = "A---B dash title"
+
+        self.write(title=title, content="body one")
+
+        stored = json.loads(tool_text(self.call("memory_read", name=title)))
+        self.assertEqual(stored["title"], title)
+        self.assertEqual(stored["body"], "body one")
+
+    def test_meta_comment_in_body_is_not_metadata(self) -> None:
+        self.write(title="body keeps comments",
+                   content="before\n\n<!-- tags: demo -->\n\nafter")
+
+        stored = json.loads(tool_text(self.call("memory_read", name="body keeps comments")))
+        self.assertIn("<!-- tags: demo -->", stored["body"])
+        self.assertEqual(stored["tags"], [])
+
+        # The real header block still parses.
+        self.write(title="tagged properly", content="x", tags=["db", "sql"])
+        proper = json.loads(tool_text(self.call("memory_read", name="tagged properly")))
+        self.assertEqual(proper["tags"], ["db", "sql"])
+        self.assertEqual(proper["body"], "x")
+
+    def test_body_heading_is_demoted_so_one_write_is_one_memory(self) -> None:
+        self.write(title="has subheading",
+                   content="intro\n\n## Sub heading\n\ntail")
+
+        self.assertEqual(json.loads(tool_text(self.call("memory_list")))["count"], 1)
+        stored = json.loads(tool_text(self.call("memory_read", name="has subheading")))
+        self.assertIn("### Sub heading", stored["body"])
+        self.assertIn("tail", stored["body"])
+
+    # -- P1: lock consistency, argument validity, scope, timestamps --------
+    def test_lock_path_does_not_depend_on_tmpdir(self) -> None:
+        sys.path.insert(0, str(SERVER.parent))
+        try:
+            import memory_server
+        finally:
+            sys.path.pop(0)
+
+        # Two processes with different TMPDIR values must still meet on one
+        # lock file, otherwise both hold the "lock" and interleave their
+        # read-modify-write cycles.
+        with mock.patch.dict(os.environ, self.env):
+            with mock.patch.object(tempfile, "tempdir", str(self.tmp / "tmp-a")):
+                first = memory_server.lock_path()
+            with mock.patch.object(tempfile, "tempdir", str(self.tmp / "tmp-b")):
+                second = memory_server.lock_path()
+
+        self.assertEqual(first, second)
+        self.assertNotIn(str(self.tmp / "tmp-a"), str(first))
+        # Beside the store, so the store <-> lock mapping cannot drift.
+        self.assertEqual(first.parent.parent, self.store.parent)
+
+    def test_list_rejects_bad_date_and_bucket(self) -> None:
+        wrong_date = self.call("memory_list", date="2026/01/01")
+        self.assertTrue(wrong_date["result"]["isError"], wrong_date)
+        self.assertIn("YYYY-MM-DD", tool_text(wrong_date))
+
+        wrong_bucket = self.call("memory_list", bucket="nonsense")
+        self.assertTrue(wrong_bucket["result"]["isError"], wrong_bucket)
+        self.assertIn("bucket", tool_text(wrong_bucket))
+
+    def test_read_honours_scope(self) -> None:
+        self.write(title="Package manager", content="global body", scope="global")
+        self.write(title="Package manager", content="project body", scope="project")
+
+        project = json.loads(tool_text(self.call("memory_read", name="Package manager")))
+        self.assertEqual(project["body"], "project body")
+
+        shared = json.loads(tool_text(
+            self.call("memory_read", name="Package manager", scope="global")))
+        self.assertEqual(shared["body"], "global body")
+        self.assertEqual(shared["scope"], "global")
+
+    def test_file_mode_timestamp_is_local(self) -> None:
+        self.env["MEMORY_ORGANIZE"] = "file"
+        self.store = self.tmp / "store-file-stamp"
+        self.env["MEMORY_ROOT"] = str(self.store)
+        self.write(title="stamped", content="x")
+
+        stored = json.loads(tool_text(self.call("memory_read", name="stamped")))
+        # A UTC stamp filed a memory written at 01:00 +08:00 under the
+        # previous day, where the since/until filters never saw it.
+        self.assertFalse(stored["updated"].endswith("Z"), stored["updated"])
+        self.assertEqual(stored["updated"][:10], datetime.now().strftime("%Y-%m-%d"))
 
     def test_lock_is_exclusive_across_processes(self) -> None:
         # A second VS Code window is a second process. The lock is what keeps
